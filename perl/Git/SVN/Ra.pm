@@ -2,7 +2,13 @@ package Git::SVN::Ra;
 use vars qw/@ISA $config_dir $_ignore_refs_regex $_log_window_size/;
 use strict;
 use warnings;
-use SVN::Client;
+use Memoize;
+use Git::SVN::Utils qw(
+	canonicalize_url
+	canonicalize_path
+	add_path_to_url
+);
+
 use SVN::Ra;
 BEGIN {
 	@ISA = qw(SVN::Ra);
@@ -26,7 +32,16 @@ BEGIN {
 	}
 }
 
+# serf has a bug that leads to a coredump upon termination if the
+# remote access object is left around (not fixed yet in serf 1.3.1).
+# Explicitly free it to work around the issue.
+END {
+	$RA = undef;
+	$ra_invalid = 1;
+}
+
 sub _auth_providers () {
+	require SVN::Client;
 	my @rv = (
 	  SVN::Client::get_simple_provider(),
 	  SVN::Client::get_ssl_server_trust_file_provider(),
@@ -62,70 +77,81 @@ sub _auth_providers () {
 	\@rv;
 }
 
-sub escape_uri_only {
-	my ($uri) = @_;
-	my @tmp;
-	foreach (split m{/}, $uri) {
-		s/([^~\w.%+-]|%(?![a-fA-F0-9]{2}))/sprintf("%%%02X",ord($1))/eg;
-		push @tmp, $_;
-	}
-	join('/', @tmp);
-}
+sub prepare_config_once {
+	SVN::_Core::svn_config_ensure($config_dir, undef);
+	my ($baton, $callbacks) = SVN::Core::auth_open_helper(_auth_providers);
+	my $config = SVN::Core::config_get_config($config_dir);
+	my $conf_t = $config->{'config'};
 
-sub escape_url {
-	my ($url) = @_;
-	if ($url =~ m#^(https?)://([^/]+)(.*)$#) {
-		my ($scheme, $domain, $uri) = ($1, $2, escape_uri_only($3));
-		$url = "$scheme://$domain$uri";
+	no warnings 'once';
+	# The usage of $SVN::_Core::SVN_CONFIG_* variables
+	# produces warnings that variables are used only once.
+	# I had not found the better way to shut them up, so
+	# the warnings of type 'once' are disabled in this block.
+	if (SVN::_Core::svn_config_get_bool($conf_t,
+	    $SVN::_Core::SVN_CONFIG_SECTION_AUTH,
+	    $SVN::_Core::SVN_CONFIG_OPTION_STORE_PASSWORDS,
+	    1) == 0) {
+		my $val = '1';
+		if (::compare_svn_version('1.9.0') < 0) { # pre-SVN r1553823
+			my $dont_store_passwords = 1;
+			$val = bless \$dont_store_passwords, "_p_void";
+		}
+		SVN::_Core::svn_auth_set_parameter($baton,
+		    $SVN::_Core::SVN_AUTH_PARAM_DONT_STORE_PASSWORDS,
+		    $val);
 	}
-	$url;
+	if (SVN::_Core::svn_config_get_bool($conf_t,
+	    $SVN::_Core::SVN_CONFIG_SECTION_AUTH,
+	    $SVN::_Core::SVN_CONFIG_OPTION_STORE_AUTH_CREDS,
+	    1) == 0) {
+		$Git::SVN::Prompt::_no_auth_cache = 1;
+	}
+
+	return ($config, $baton, $callbacks);
+} # no warnings 'once'
+
+INIT {
+	Memoize::memoize '_auth_providers';
+	Memoize::memoize 'prepare_config_once';
 }
 
 sub new {
 	my ($class, $url) = @_;
-	$url =~ s!/+$!!;
-	return $RA if ($RA && $RA->{url} eq $url);
+	$url = canonicalize_url($url);
+	return $RA if ($RA && $RA->url eq $url);
 
 	::_req_svn();
 
-	SVN::_Core::svn_config_ensure($config_dir, undef);
-	my ($baton, $callbacks) = SVN::Core::auth_open_helper(_auth_providers);
-	my $config = SVN::Core::config_get_config($config_dir);
 	$RA = undef;
-	my $dont_store_passwords = 1;
-	my $conf_t = ${$config}{'config'};
-	{
-		no warnings 'once';
-		# The usage of $SVN::_Core::SVN_CONFIG_* variables
-		# produces warnings that variables are used only once.
-		# I had not found the better way to shut them up, so
-		# the warnings of type 'once' are disabled in this block.
-		if (SVN::_Core::svn_config_get_bool($conf_t,
-		    $SVN::_Core::SVN_CONFIG_SECTION_AUTH,
-		    $SVN::_Core::SVN_CONFIG_OPTION_STORE_PASSWORDS,
-		    1) == 0) {
-			SVN::_Core::svn_auth_set_parameter($baton,
-			    $SVN::_Core::SVN_AUTH_PARAM_DONT_STORE_PASSWORDS,
-			    bless (\$dont_store_passwords, "_p_void"));
-		}
-		if (SVN::_Core::svn_config_get_bool($conf_t,
-		    $SVN::_Core::SVN_CONFIG_SECTION_AUTH,
-		    $SVN::_Core::SVN_CONFIG_OPTION_STORE_AUTH_CREDS,
-		    1) == 0) {
-			$Git::SVN::Prompt::_no_auth_cache = 1;
-		}
-	} # no warnings 'once'
-	my $self = SVN::Ra->new(url => escape_url($url), auth => $baton,
+	my ($config, $baton, $callbacks) = prepare_config_once();
+	my $self = SVN::Ra->new(url => $url, auth => $baton,
 	                      config => $config,
 			      pool => SVN::Pool->new,
 	                      auth_provider_callbacks => $callbacks);
-	$self->{url} = $url;
+	$RA = bless $self, $class;
+
+	# Make sure its canonicalized
+	$self->url($url);
 	$self->{svn_path} = $url;
 	$self->{repos_root} = $self->get_repos_root;
 	$self->{svn_path} =~ s#^\Q$self->{repos_root}\E(/|$)##;
 	$self->{cache} = { check_path => { r => 0, data => {} },
 	                   get_dir => { r => 0, data => {} } };
-	$RA = bless $self, $class;
+
+	return $RA;
+}
+
+sub url {
+	my $self = shift;
+
+	if (@_) {
+		my $url = shift;
+		$self->{url} = canonicalize_url($url);
+		return;
+	}
+
+	return $self->{url};
 }
 
 sub check_path {
@@ -153,7 +179,17 @@ sub get_dir {
 		}
 	}
 	my $pool = SVN::Pool->new;
-	my ($d, undef, $props) = $self->SUPER::get_dir($dir, $r, $pool);
+	my ($d, undef, $props);
+
+	if (::compare_svn_version('1.4.0') >= 0) {
+		# n.b. in addition to being potentially more efficient,
+		# this works around what appears to be a bug in some
+		# SVN 1.8 versions
+		my $kind = 1; # SVN_DIRENT_KIND
+		($d, undef, $props) = $self->get_dir2($dir, $r, $kind, $pool);
+	} else {
+		($d, undef, $props) = $self->SUPER::get_dir($dir, $r, $pool);
+	}
 	my %dirents = map { $_ => { kind => $d->{$_}->kind } } keys %$d;
 	$pool->clear;
 	if ($r != $cache->{r}) {
@@ -162,10 +198,6 @@ sub get_dir {
 	}
 	$cache->{data}->{$dir} = [ \%dirents, $r, $props ];
 	wantarray ? (\%dirents, $r, $props) : \%dirents;
-}
-
-sub DESTROY {
-	# do not call the real DESTROY since we store ourselves in $RA
 }
 
 # get_log(paths, start, end, limit,
@@ -195,6 +227,7 @@ sub get_log {
 				qw/copyfrom_path copyfrom_rev action/;
 			if ($s{'copyfrom_path'}) {
 				$s{'copyfrom_path'} =~ s/$prefix_regex//;
+				$s{'copyfrom_path'} = canonicalize_path($s{'copyfrom_path'});
 			}
 			$_[0]{$p} = \%s;
 		}
@@ -218,7 +251,10 @@ sub get_log {
 	$ret;
 }
 
+# uncommon, only for ancient SVN (<= 1.4.2)
 sub trees_match {
+	require IO::File;
+	require SVN::Client;
 	my ($self, $url1, $rev1, $url2, $rev2) = @_;
 	my $ctx = SVN::Client->new(auth => _auth_providers);
 	my $out = IO::File->new_tmpfile;
@@ -246,7 +282,7 @@ sub get_commit_editor {
 sub gs_do_update {
 	my ($self, $rev_a, $rev_b, $gs, $editor) = @_;
 	my $new = ($rev_a == $rev_b);
-	my $path = $gs->{path};
+	my $path = $gs->path;
 
 	if ($new && -e $gs->{index}) {
 		unlink $gs->{index} or die
@@ -282,30 +318,33 @@ sub gs_do_update {
 # svn_ra_reparent didn't work before 1.4)
 sub gs_do_switch {
 	my ($self, $rev_a, $rev_b, $gs, $url_b, $editor) = @_;
-	my $path = $gs->{path};
+	my $path = $gs->path;
 	my $pool = SVN::Pool->new;
 
-	my $full_url = $self->{url};
-	my $old_url = $full_url;
-	$full_url .= '/' . $path if length $path;
+	my $old_url = $self->url;
+	my $full_url = add_path_to_url( $self->url, $path );
 	my ($ra, $reparented);
 
-	if ($old_url =~ m#^svn(\+ssh)?://# ||
+	if ($old_url =~ m#^svn(\+\w+)?://# ||
 	    ($full_url =~ m#^https?://# &&
-	     escape_url($full_url) ne $full_url)) {
+	     canonicalize_url($full_url) ne $full_url)) {
 		$_[0] = undef;
 		$self = undef;
 		$RA = undef;
 		$ra = Git::SVN::Ra->new($full_url);
 		$ra_invalid = 1;
 	} elsif ($old_url ne $full_url) {
-		SVN::_Ra::svn_ra_reparent($self->{session}, $full_url, $pool);
-		$self->{url} = $full_url;
+		SVN::_Ra::svn_ra_reparent(
+			$self->{session},
+			canonicalize_url($full_url),
+			$pool
+		);
+		$self->url($full_url);
 		$reparented = 1;
 	}
 
 	$ra ||= $self;
-	$url_b = escape_url($url_b);
+	$url_b = canonicalize_url($url_b);
 	my $reporter = $ra->do_switch($rev_b, '', 1, $url_b, $editor, $pool);
 	my @lock = (::compare_svn_version('1.2.0') >= 0) ? (undef) : ();
 	$reporter->set_path('', $rev_a, 0, @lock, $pool);
@@ -313,7 +352,7 @@ sub gs_do_switch {
 
 	if ($reparented) {
 		SVN::_Ra::svn_ra_reparent($self->{session}, $old_url, $pool);
-		$self->{url} = $old_url;
+		$self->url($old_url);
 	}
 
 	$pool->clear;
@@ -326,7 +365,7 @@ sub longest_common_path {
 	my $common_max = scalar @$gsv;
 
 	foreach my $gs (@$gsv) {
-		my @tmp = split m#/#, $gs->{path};
+		my @tmp = split m#/#, $gs->path;
 		my $p = '';
 		foreach (@tmp) {
 			$p .= length($p) ? "/$_" : $_;
@@ -359,10 +398,22 @@ sub longest_common_path {
 sub gs_fetch_loop_common {
 	my ($self, $base, $head, $gsv, $globs) = @_;
 	return if ($base > $head);
+	# Make sure the cat_blob open2 FileHandle is created before calling
+	# SVN::Pool::new_default so that it does not incorrectly end up in the pool.
+	$::_repository->_open_cat_blob_if_needed;
+	my $gpool = SVN::Pool->new_default;
+	my $ra_url = $self->url;
+	my $reload_ra = sub {
+		$_[0] = undef;
+		$self = undef;
+		$RA = undef;
+		$gpool->clear;
+		$self = Git::SVN::Ra->new($ra_url);
+		$ra_invalid = undef;
+	};
 	my $inc = $_log_window_size;
 	my ($min, $max) = ($base, $head < $base + $inc ? $head : $base + $inc);
 	my $longest_path = longest_common_path($gsv, $globs);
-	my $ra_url = $self->{url};
 	my $find_trailing_edge;
 	while (1) {
 		my %revs;
@@ -407,9 +458,9 @@ sub gs_fetch_loop_common {
 		}
 		$SVN::Error::handler = $err_handler;
 
-		my %exists = map { $_->{path} => $_ } @$gsv;
+		my %exists = map { $_->path => $_ } @$gsv;
 		foreach my $r (sort {$a <=> $b} keys %revs) {
-			my ($paths, $logged) = @{$revs{$r}};
+			my ($paths, $logged) = @{delete $revs{$r}};
 
 			foreach my $gs ($self->match_globs(\%exists, $paths,
 			                                   $globs, $r)) {
@@ -432,13 +483,7 @@ sub gs_fetch_loop_common {
 				        "$g->{t}-maxRev";
 				Git::SVN::tmp_config($k, $r);
 			}
-			if ($ra_invalid) {
-				$_[0] = undef;
-				$self = undef;
-				$RA = undef;
-				$self = Git::SVN::Ra->new($ra_url);
-				$ra_invalid = undef;
-			}
+			$reload_ra->() if $ra_invalid;
 		}
 		# pre-fill the .rev_db since it'll eventually get filled in
 		# with '0' x40 if something new gets committed
@@ -455,6 +500,8 @@ sub gs_fetch_loop_common {
 		$min = $max + 1;
 		$max += $inc;
 		$max = $head if ($max > $head);
+
+		$reload_ra->();
 	}
 	Git::SVN::gc();
 }
@@ -508,7 +555,7 @@ sub match_globs {
 				 ($self->check_path($p, $r) !=
 				  $SVN::Node::dir));
 			next unless $p =~ /$g->{path}->{regex}/;
-			$exists->{$p} = Git::SVN->init($self->{url}, $p, undef,
+			$exists->{$p} = Git::SVN->init($self->url, $p, undef,
 					 $g->{ref}->full_path($de), 1);
 		}
 	}
@@ -532,7 +579,7 @@ sub match_globs {
 			next if ($self->check_path($pathname, $r) !=
 			         $SVN::Node::dir);
 			$exists->{$pathname} = Git::SVN->init(
-			                      $self->{url}, $pathname, undef,
+			                      $self->url, $pathname, undef,
 			                      $g->{ref}->full_path($p), 1);
 		}
 		my $c = '';
@@ -548,19 +595,20 @@ sub match_globs {
 
 sub minimize_url {
 	my ($self) = @_;
-	return $self->{url} if ($self->{url} eq $self->{repos_root});
+	return $self->url if ($self->url eq $self->{repos_root});
 	my $url = $self->{repos_root};
 	my @components = split(m!/!, $self->{svn_path});
 	my $c = '';
 	do {
-		$url .= "/$c" if length $c;
+		$url = add_path_to_url($url, $c);
 		eval {
 			my $ra = (ref $self)->new($url);
 			my $latest = $ra->get_latest_revnum;
 			$ra->get_log("", $latest, 0, 1, 0, 1, sub {});
 		};
 	} while ($@ && ($c = shift @components));
-	$url;
+
+	return canonicalize_url($url);
 }
 
 sub can_do_switch {
@@ -568,7 +616,7 @@ sub can_do_switch {
 	unless (defined $can_do_switch) {
 		my $pool = SVN::Pool->new;
 		my $rep = eval {
-			$self->do_switch(1, '', 0, $self->{url},
+			$self->do_switch(1, '', 0, $self->url,
 			                 SVN::Delta::Editor->new, $pool);
 		};
 		if ($@) {
@@ -616,6 +664,8 @@ sub skip_unknown_revs {
 
 1;
 __END__
+
+=head1 NAME
 
 Git::SVN::Ra - Subversion remote access functions for git-svn
 
